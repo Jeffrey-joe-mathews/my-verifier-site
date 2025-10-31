@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Certificate Verifier</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako.min.js"></script>
+
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            margin: 0;
+            padding: 2rem;
+            background-color: #f4f7f6;
+            color: #333;
+        }
+        .container {
+            max-width: 800px;
+            margin: auto;
+            background: #fff;
+            border-radius: 8px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.05);
+            overflow: hidden;
+        }
+        #status {
+            font-size: 1.5rem;
+            font-weight: 600;
+            padding: 1.5rem 2rem;
+            border-bottom: 1px solid #eee;
+        }
+        #status.valid {
+            background-color: #e6f7ed;
+            color: #1d643b;
+        }
+        #status.invalid {
+            background-color: #fff0f0;
+            color: #d93030;
+        }
+        #status.loading {
+            background-color: #f0f4f8;
+            color: #4a6582;
+        }
+        #details {
+            padding: 2rem;
+            background-color: #fdfdfd;
+        }
+        pre {
+            background: #282c34;
+            color: #abb2bf;
+            padding: 1.5rem;
+            border-radius: 6px;
+            overflow-x: auto;
+            font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+            font-size: 0.875rem;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="container">
+        <div id="status" class="loading">⌛ Verifying...</div>
+        <div id="details">
+            <pre id="json-output">Waiting for certificate data...</pre>
+        </div>
+    </div>
+
+    <script>
+        // --------------------------------------------------------------------
+        // ⬇️ IMPORTANT! PASTE YOUR PUBLIC KEY HERE ⬇️
+        // --------------------------------------------------------------------
+        // Open your 'keys/public.pem' file and paste its *entire*
+        // content between the backticks (`), replacing this comment.
+        // --------------------------------------------------------------------
+        const PUBLIC_KEY_PEM = `
+-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAp/8HrJQPVwBX0sTzrtMf
+hfSO3/G1doGQe8i/KoLxlaSNGd3LyiJi62OZqz2Ome6YbUkGfPzZ4briImKYdf7+
+X7KYMTPphf7NqGssVHcDLKV5JXYG86v397BFPfIPHlNjVjXxZEljD2+eScGFgm9x
+kAOWY2KgZzgnDaJK9fjrMrqLxY7mxjL6pBCoNQOy9JtqPsAS64SDIntUp5iJ0Mal
+vO4iOTaWQAylCAw4uI3jY6XHXzd6ZZ8+I6jW5lT6cxvO6W+FCRHE7xXAjTAxrXHg
+vYb5dgUdcs/WUoExV//nuLkaxcgo7qVp2/9E7H6DbqPYxvM8dlE3SCn/DWSObG3D
+IQIDAQAB
+-----END PUBLIC KEY-----
+`;
+
+        // --- Main execution starts on page load ---
+        window.onload = async () => {
+            const statusEl = document.getElementById('status');
+            const jsonEl = document.getElementById('json-output');
+
+            try {
+                // 1. Get the payload from the URL fragment (#...)
+                const payload = await getPayloadFromFragment();
+                if (!payload) {
+                    throw new Error("No certificate data found in URL.");
+                }
+
+                // 2. Verify the payload's signature
+                const isValid = await verifyPayload(payload);
+
+                // 3. Display the results
+                if (isValid) {
+                    statusEl.textContent = '✅ Certificate is VALID';
+                    statusEl.className = 'valid';
+                    jsonEl.textContent = JSON.stringify(payload.cert, null, 2);
+                } else {
+                    throw new Error("Signature is invalid.");
+                }
+
+            } catch (err) {
+                console.error("Verification failed:", err);
+                statusEl.textContent = `❌ Certificate verification FAILED`;
+                statusEl.className = 'invalid';
+                jsonEl.textContent = `Error: ${err.message}`;
+            }
+        };
+
+        /**
+         * Gets the payload object from the URL fragment.
+         * Handles both ONLINE (http link) and OFFLINE (zlib compressed) modes.
+         */
+        async function getPayloadFromFragment() {
+            const fragment = window.location.hash.substring(1);
+            if (!fragment) return null;
+
+            if (fragment.startsWith('http')) {
+                // --- ONLINE Mode ---
+                // The fragment is a URL to the hosted JSON file
+                console.log("Mode: Online (fetching URL)");
+                const response = await fetch(fragment);
+                if (!response.ok) {
+                    throw new Error(`Failed to fetch certificate data from URL: ${response.statusText}`);
+                }
+                return await response.json();
+            } else {
+                // --- OFFLINE Mode ---
+                // The fragment is base64url-encoded, zlib-compressed JSON
+                console.log("Mode: Offline (decoding fragment)");
+                return decodeFragmentPayload(fragment);
+            }
+        }
+
+        /**
+         * Decodes the offline payload.
+         * This is the JavaScript version of 'payload_utils.py -> decode_fragment_payload'
+         */
+        function decodeFragmentPayload(b64url) {
+            // 1. Add base64 padding
+            let b64 = b64url.replace(/-/g, '+').replace(/_/g, '/');
+            const pad = b64.length % 4;
+            if (pad) {
+                b64 += '='.repeat(4 - pad);
+            }
+
+            // 2. Decode base64 string to Uint8Array
+            const raw = window.atob(b64);
+            const compressed = new Uint8Array(raw.length);
+            for (let i = 0; i < raw.length; i++) {
+                compressed[i] = raw.charCodeAt(i);
+            }
+
+            // 3. Decompress zlib data using pako.js
+            const decompressed = pako.inflate(compressed);
+
+            // 4. Decode from Uint8Array to string
+            const jsonString = new TextDecoder().decode(decompressed);
+            return JSON.parse(jsonString);
+        }
+
+        /**
+         * Verifies the payload signature using the Web Crypto API.
+         * This is the JavaScript version of 'sign.py -> verify_json_bytes'
+         */
+        async function verifyPayload(payload) {
+            if (!payload || !payload.cert || !payload.sig) {
+                throw new Error("Payload is malformed. Missing 'cert' or 'sig'.");
+            }
+
+            const cryptoKey = await importPublicKey(PUBLIC_KEY_PEM);
+
+            // 1. Canonicalize the certificate JSON
+            // Matches 'payload_utils.py -> canonical_json'
+            const certString = JSON.stringify(payload.cert, Object.keys(payload.cert).sort(), 0);
+            const certData = new TextEncoder().encode(certString);
+
+            // 2. Decode the base64 signature
+            const signature = Uint8Array.from(atob(payload.sig), c => c.charCodeAt(0));
+
+            // 3. Verify the signature
+            return window.crypto.subtle.verify(
+                {
+                    name: "RSASSA-PKCS1-v1_5",
+                    hash: "SHA-256",
+                },
+                cryptoKey,
+                signature,
+                certData
+            );
+        }
+
+        /**
+         * Helper function to import the PEM public key string for Web Crypto API use.
+         */
+        async function importPublicKey(pem) {
+            // 1. Strip PEM headers and footers
+            const pemHeader = "-----BEGIN PUBLIC KEY-----";
+            const pemFooter = "-----END PUBLIC KEY-----";
+            const pemContents = pem.replace(pemHeader, "").replace(pemFooter, "").replace(/\s/g, "");
+
+            // 2. Base64-decode to an ArrayBuffer
+            const binaryDer = Uint8Array.from(atob(pemContents), c => c.charCodeAt(0));
+
+            // 3. Import the key
+            return window.crypto.subtle.importKey(
+                "spki",
+                binaryDer.buffer,
+                {
+                    name: "RSASSA-PKCS1-v1_5",
+                    hash: "SHA-256",
+                },
+                true,
+                ["verify"]
+            );
+        }
+
+    </script>
+</body>
+</html>
